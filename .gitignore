@@ -1,5 +1,6 @@
 .idea
 .env.local
+.env
 .pyc
 __pycache__
 .venv
