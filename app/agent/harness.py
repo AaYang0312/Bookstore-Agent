@@ -2,6 +2,7 @@ from openai import OpenAI
 from app.schemas import ChatMessage
 from app.config import settings
 from app.agent.prompt import SYSTEM_PROMPT
+from app.agent.tool_prompt import TOOL_PROMPT
 from app.tools.registry import TOOLS, execute_tool
 
 MAX_TOOL_ROUNDS = 5
@@ -25,7 +26,8 @@ def model_call(history: list[ChatMessage], message: str) -> str:
     Returns:
         模型响应的文本内容
     """
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}, *_convert_history(history),
+    system_content = f"{SYSTEM_PROMPT}\n\n{TOOL_PROMPT}"
+    messages = [{"role": "system", "content": system_content}, *_convert_history(history),
                 {"role": "user", "content": message}]
 
     response = client.chat.completions.create(

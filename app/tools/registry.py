@@ -1,7 +1,7 @@
 # 注册工具
 import json
 import logging
-from app.tools.book import search_books, BookAPIError
+from app.tools.book import search_books, get_book_detail, BookAPIError
 
 logger = logging.getLogger(__name__)
 
@@ -38,11 +38,31 @@ TOOLS = [
                 "additionalProperties": False,
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_book_detail",
+            "description": "根据书籍 id 获取对应书籍详细信息",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "book_id": {
+                        "type": "integer",
+                        "description": "书籍 id",
+                        "minimum": 1,
+                    }
+                },
+                "required": ["book_id"],
+                "additionalProperties": False,
+            }
+        }
     }
 ]
 
 TOOL_MAP = {
     "search_books": search_books,
+    "get_book_detail": get_book_detail
 }
 
 def execute_tool(tool_call) -> str:
