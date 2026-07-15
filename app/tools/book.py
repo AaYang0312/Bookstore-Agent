@@ -5,6 +5,8 @@ from app.config import settings
 class BookAPIError(Exception):
     """图书 API 调用异常"""
     pass
+def _create_http_client(timeout: float, trust_env: bool) -> httpx.Client:
+    return httpx.Client(timeout=timeout, trust_env=trust_env)
 
 def search_books(keyword: str, page: int = 1, page_size: int = 5) -> dict:
     """
@@ -44,7 +46,7 @@ def search_books(keyword: str, page: int = 1, page_size: int = 5) -> dict:
 
     # 捕获并转换 HTTPX 异常为 BookAPIError
     try:
-        with httpx.Client(timeout=5.0, trust_env=False) as client:
+        with _create_http_client(timeout=5.0, trust_env=False) as client:
             response = client.get(
                 base_url+"/book/search",
                 params={
