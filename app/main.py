@@ -13,7 +13,10 @@ def health_check():
 
 @app.post("/api/v1/agent/chat", response_model=AgentChatResponse)
 def chat(request: AgentChatRequest):
-    reply = model_call(history=request.history, message=request.message)
+    try:
+        reply = model_call(history=request.history, message=request.message)
+    except RuntimeError as e:
+        reply = f"抱歉，处理您的请求时出现问题：{e}"
 
     return AgentChatResponse(
         message=reply,

@@ -9,6 +9,9 @@ class Settings(BaseSettings):
     model_base_url: str | None = None
     model_api_key: SecretStr = Field(min_length=1)
 
+    # 网络配置
+    bookstore_api_base_url: str = "http://localhost:8080/api/v1"
+
     # 读取行为
     model_config = SettingsConfigDict(
         env_file=".env",
