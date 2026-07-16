@@ -2,6 +2,7 @@
 import json
 import logging
 from app.tools.book import search_books, get_book_detail, BookAPIError
+from app.tools.web import search_web, WebSearchError
 
 logger = logging.getLogger(__name__)
 
@@ -57,12 +58,40 @@ TOOLS = [
                 "additionalProperties": False,
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_web",
+            "description": "搜索互联网内容，帮助用户发现最近值得阅读的书籍、书评或推荐信息",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "搜索关键词",
+                        "minLength": 1,
+                        "maxLength": 200,
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "返回结果数量",
+                        "default": 5,
+                        "minimum": 1,
+                        "maximum": 10,
+                    }
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+            }
+        }
     }
 ]
 
 TOOL_MAP = {
     "search_books": search_books,
-    "get_book_detail": get_book_detail
+    "get_book_detail": get_book_detail,
+    "search_web": search_web,
 }
 
 def execute_tool(tool_call) -> str:
@@ -94,6 +123,8 @@ def execute_tool(tool_call) -> str:
     try:
         result = func(**args)
     except BookAPIError as e:
+        return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
+    except WebSearchError as e:
         return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
     except TypeError as e:
         return json.dumps({"ok": False, "error": f"参数错误: {e}"}, ensure_ascii=False)

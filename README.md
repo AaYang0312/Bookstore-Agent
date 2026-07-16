@@ -5,7 +5,7 @@
 ## 功能特性
 
 - 自然语言对话：以购书助手角色与用户交流
-- 工具调用：通过 `search_books` 工具查询书城真实库存、价格等信息
+- 工具调用：通过 `search_books`、`get_book_detail` 工具查询书城真实库存、价格等信息
 - 多轮工具调用：支持最多 5 轮工具调用，满足复杂查询需求
 - OpenAI 兼容：使用 OpenAI Python SDK，兼容所有 OpenAI API 格式的服务
 
@@ -114,5 +114,6 @@ GET /model-info
 | 工具名 | 功能 | 参数 |
 |--------|------|------|
 | `search_books` | 按关键词搜索图书 | `keyword`（必填）、`page`、`page_size` |
+| `get_book_detail` | 查看图书详情 | `book_id`（必填，书籍 ID，从 1 开始） |
 
 工具调用流程：模型决定调用工具 → Agent 执行工具并获取结果 → 将结果返回模型 → 模型生成最终回答。
