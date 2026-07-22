@@ -47,13 +47,16 @@ def test_book_search(monkeypatch):
     # 3. 保存真正的 Client，避免 monkeypatch 后递归调用自己
     real_client_class = httpx.Client
 
-    def mock_client_factory(*args, **kwargs):
-        kwargs["transport"] = transport
-        return real_client_class(*args, **kwargs)
+    def mock_client_factory(timeout, trust_env):
+        return real_client_class(
+            timeout=timeout,
+            trust_env=trust_env,
+            transport=transport,
+        )
 
     monkeypatch.setattr(
         book_module,
-        "Client",
+        "_create_http_client",
         mock_client_factory,
     )
 

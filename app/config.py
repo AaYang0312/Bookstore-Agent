@@ -11,6 +11,7 @@ class Settings(BaseSettings):
 
     # 网络配置
     bookstore_api_base_url: str = "http://localhost:8080/api/v1"
+    bookstore_admin_base_url: str = "http://localhost:8080/admin"
     tavily_api_key: SecretStr = Field(min_length=1)
 
     # 读取行为

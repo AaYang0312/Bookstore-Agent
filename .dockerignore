@@ -1,0 +1,8 @@
+.git
+.idea
+.pytest_cache
+.venv
+__pycache__
+*.py[cod]
+.env
+.DS_Store

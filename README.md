@@ -40,6 +40,13 @@ app/
 pip install -r requirements.txt
 ```
 
+需要运行测试时安装开发依赖：
+
+```bash
+pip install -r requirements-dev.txt
+pytest -q
+```
+
 ### 2. 配置环境变量
 
 复制 `.env.example` 为 `.env`，填入实际配置：
@@ -55,7 +62,9 @@ cp .env.example .env
 | `MODEL_NAME` | 是 | 模型名称，如 `gpt-4o` |
 | `MODEL_API_KEY` | 是 | 模型 API 密钥 |
 | `MODEL_BASE_URL` | 否 | 模型 API 地址（用于非 OpenAI 官方服务） |
+| `TAVILY_API_KEY` | 是 | Tavily 联网搜索 API 密钥 |
 | `BOOKSTORE_API_BASE_URL` | 否 | 书城 Go 后端地址，默认 `http://localhost:8080/api/v1` |
+| `BOOKSTORE_ADMIN_BASE_URL` | 否 | 书城管理 API 地址，默认 `http://localhost:8080/admin` |
 
 ### 3. 启动服务
 
@@ -64,6 +73,38 @@ uvicorn app.main:app --reload
 ```
 
 服务启动后访问 `http://localhost:8000/docs` 查看 API 文档。
+
+## Docker 快速部署
+
+### 构建并单独运行 Agent
+
+先按上文准备 `.env`，然后执行：
+
+```bash
+docker build -t bookstore-agent .
+docker run --rm \
+  --name bookstore-agent \
+  -p 8000:8000 \
+  --env-file .env \
+  -e BOOKSTORE_API_BASE_URL=http://host.docker.internal:8080/api/v1 \
+  bookstore-agent
+```
+
+以上命令适用于 Docker Desktop，且 Go 后端运行在宿主机 8080 端口。Linux 环境请改用容器网络中的后端服务名，或显式配置宿主机网关。镜像以非 root 用户运行，并通过 `GET /health` 进行健康检查。
+
+### 一键启动三个项目
+
+推荐使用前端仓库中的 Compose 编排，它会同时启动前端、Go 后端、Agent、MySQL 和 Redis，并自动把 `BOOKSTORE_API_BASE_URL` 设置为容器内后端地址：
+
+```bash
+cd ../bookstore-fronted-master
+cp .env.docker.example .env.docker
+# 编辑 .env.docker，填写 MODEL_* 和 TAVILY_API_KEY
+docker compose --env-file .env.docker up --build -d
+docker compose ps
+```
+
+启动后可访问 `http://localhost:8000/health` 和 `http://localhost:8000/docs`。占位密钥可以让服务通过健康检查，但实际对话和联网搜索必须使用有效密钥。
 
 ## API 接口
 
