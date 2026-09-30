@@ -5,3 +5,6 @@ pydantic==2.13.4
 pydantic_settings==2.14.2
 tavily-python
 uvicorn
+pymilvus==2.5.14
+redis==5.2.1
+apscheduler==3.10.4

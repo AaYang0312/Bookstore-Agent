@@ -1,8 +1,17 @@
 # 注册工具
 import json
 import logging
+from app.config import settings
 from app.tools.book import search_books, get_book_detail, BookAPIError
 from app.tools.web import search_web, WebSearchError
+from app.tools.user import (
+    get_user_profile,
+    get_user_orders,
+    get_user_favorites,
+    get_browse_history,
+    UserAPIError,
+)
+from app.tools.rag_search import semantic_search_books, rag_available, RAGSearchError
 
 logger = logging.getLogger(__name__)
 
@@ -88,43 +97,181 @@ TOOLS = [
     }
 ]
 
+# 语义检索工具：仅在 Milvus 与 Embedding 均已配置时注册，未配置时完全不暴露
+if rag_available():
+    TOOLS.append({
+        "type": "function",
+        "function": {
+            "name": "semantic_search_books",
+            "description": (
+                "按自然语言语义需求在书城中找书（如'想找讲宇宙文明的科幻小说'、"
+                "'适合入门的心理学书'）。模糊、描述性找书用这个；"
+                "已知精确书名/作者时请改用 search_books"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "自然语言找书需求描述",
+                        "minLength": 1,
+                        "maxLength": 200,
+                    },
+                    "category": {
+                        "type": "string",
+                        "description": "可选，限定图书分类名称",
+                        "maxLength": 50,
+                    },
+                    "max_price": {
+                        "type": "integer",
+                        "description": "可选，价格上限（元）",
+                        "minimum": 0,
+                    }
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+            }
+        }
+    })
+
+# 用户数据工具：随用户模块一并注册（无 JWT 时返回结构化降级提示而非报错）
+TOOLS.extend([
+    {
+        "type": "function",
+        "function": {
+            "name": "get_user_profile",
+            "description": "获取当前登录用户的个人资料（用户名、邮箱等基本信息）",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_user_orders",
+            "description": "获取当前登录用户最近的订单列表（含订单内图书、金额与状态）",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "page": {
+                        "type": "integer",
+                        "description": "页码",
+                        "default": 1,
+                        "minimum": 1,
+                    },
+                    "page_size": {
+                        "type": "integer",
+                        "description": "每页数量",
+                        "default": 5,
+                        "minimum": 1,
+                        "maximum": 10,
+                    }
+                },
+                "additionalProperties": False,
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_user_favorites",
+            "description": "获取当前登录用户收藏的图书列表",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "page": {
+                        "type": "integer",
+                        "description": "页码",
+                        "default": 1,
+                        "minimum": 1,
+                    },
+                    "page_size": {
+                        "type": "integer",
+                        "description": "每页数量",
+                        "default": 5,
+                        "minimum": 1,
+                        "maximum": 10,
+                    }
+                },
+                "additionalProperties": False,
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_browse_history",
+            "description": "获取当前登录用户最近的图书浏览记录",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "page": {
+                        "type": "integer",
+                        "description": "页码",
+                        "default": 1,
+                        "minimum": 1,
+                    },
+                    "page_size": {
+                        "type": "integer",
+                        "description": "每页数量",
+                        "default": 5,
+                        "minimum": 1,
+                        "maximum": 10,
+                    }
+                },
+                "additionalProperties": False,
+            }
+        }
+    },
+])
+
 TOOL_MAP = {
     "search_books": search_books,
     "get_book_detail": get_book_detail,
     "search_web": search_web,
+    "semantic_search_books": semantic_search_books,
+    "get_user_profile": get_user_profile,
+    "get_user_orders": get_user_orders,
+    "get_user_favorites": get_user_favorites,
+    "get_browse_history": get_browse_history,
 }
 
-def execute_tool(tool_call) -> str:
+def execute_tool(name: str, arguments: str) -> str:
     """
-    执行 LLM 返回的 tool_call，返回 JSON 字符串结果
+    执行 LLM 返回的工具调用，返回 JSON 字符串结果
 
     Args:
-        tool_call: OpenAI 格式的 tool_call 对象
+        name: 工具名称
+        arguments: 工具参数（JSON 字符串）
     """
-    # 1. 读取工具名称
-    name = tool_call.function.name
-
-    # 2. 检查工具是否存在
+    # 1. 检查工具是否存在
     func = TOOL_MAP.get(name)
     if not func:
         return json.dumps({"ok": False, "error": f"未知工具: {name}"}, ensure_ascii=False)
 
-    # 3. 解析 arguments JSON
+    # 2. 解析 arguments JSON
     try:
-        args = json.loads(tool_call.function.arguments)
+        args = json.loads(arguments)
     except json.JSONDecodeError:
         return json.dumps({"ok": False, "error": "工具参数不是合法 JSON"}, ensure_ascii=False)
 
-    # 4. 确认结果是字典
+    # 3. 确认结果是字典
     if not isinstance(args, dict):
         return json.dumps({"ok": False, "error": "工具参数必须是对象"}, ensure_ascii=False)
 
-    # 5. 调用 handler(**args)
+    # 4. 调用 handler(**args)
     try:
         result = func(**args)
     except BookAPIError as e:
         return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
     except WebSearchError as e:
+        return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
+    except UserAPIError as e:
+        return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
+    except RAGSearchError as e:
         return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
     except TypeError as e:
         return json.dumps({"ok": False, "error": f"参数错误: {e}"}, ensure_ascii=False)
@@ -132,5 +279,5 @@ def execute_tool(tool_call) -> str:
         logger.exception("工具 %s 执行失败", name)
         return json.dumps({"ok": False, "error": "工具执行失败，请稍后重试"}, ensure_ascii=False)
 
-    # 6. 序列化工具结果
+    # 5. 序列化工具结果
     return json.dumps(result, ensure_ascii=False)
