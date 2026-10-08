@@ -7,11 +7,11 @@
 
 - 自然语言对话：以购书助手角色与用户交流
 - 工具调用：14 个工具覆盖关键词搜索、语义找书、图书详情、联网搜索、用户画像/订单/收藏/浏览，以及收藏管理、代下单、取消订单等写操作（带确认策略）
-- 写操作闭环：可代用户创建**待支付订单**（不代支付，30 分钟未支付自动取消）与取消订单；下单走 Kafka 异步受理，工具内部轮询结果；幂等键防重复下单；Prompt 强制"复述书目与总价并获用户确认后才可下单"
+- 写操作闭环（**确认卡片机制**）：LLM 只能"提议"下单/取消（`propose_order`/`propose_cancel_order` 生成确认卡片），真实执行仅发生在用户点击确认后、由服务端用存储的原始参数执行——机制级杜绝 LLM 自作主张下单；卡片含书目/数量/预估总价（服务端按书城现价计算），支持 Kafka 异步下单的内部轮询与幂等键防重
 - RAG 知识库：Milvus 向量检索 + 可选 Rerank 重排，支持"模糊找书"语义命中
 - 个性化推荐：JWT 透传拉取书城聚合画像，注入 System Prompt（无登录自动降级）
 - 对话记忆：Redis 滑动窗口 + LLM 摘要两级记忆，跨请求上下文连贯，前端传 history 仍兼容
-- 流式输出：SSE 逐 token 推送，工具调用过程可见（`delta` / `tool_start` / `tool_end` / `done` / `error`）
+- 流式输出：SSE 逐 token 推送，工具调用过程可见（`delta` / `tool_start` / `tool_end` / `confirm_request` / `done` / `error`）
 - 增量同步：基于 `updated_at` 水位的向量库增量入库管道（CLI + 可选定时任务）
 - 优雅降级：未配置 Milvus/Embedding/Redis 时相关工具与能力自动降级，原有三工具行为不变
 
@@ -104,6 +104,7 @@ app/
 └── tools/
     ├── registry.py             # 工具注册（RAG 未配置时 semantic 工具不注册）
     ├── bookstore_api.py        # 书城 HTTP 共享层（JWT 透传 + 非 2xx 业务 message 保留）
+    ├── write_gate.py           # 写操作确认门（待确认操作存储 + 确认消息解析）
     ├── book.py / web.py        # 原有三工具（行为不变）
     ├── rag_search.py           # semantic_search_books（语义找书）
     ├── user.py                 # 画像/订单/收藏/浏览四工具（无 JWT 结构化降级）
@@ -212,6 +213,7 @@ Authorization: Bearer <JWT>   （可选；提供后启用个性化）
 
 ```
 GET /api/v1/agent/chat/stream?message=想找讲宇宙文明的科幻小说&conversation_id=conv_001
+POST /api/v1/agent/chat/stream      # 请求体与同步 /chat 一致（可携带 history），响应同为 SSE
 Authorization: Bearer <JWT>   （可选）
 ```
 
@@ -229,12 +231,21 @@ data: {"name": "semantic_search_books", "arguments": {"query": "宇宙文明 科
 event: tool_end
 data: {"name": "semantic_search_books", "result": "{\"ok\": true, ...}"}
 
+event: confirm_request
+data: {"operation_id": "a1b2...", "summary": {"type": "create_order", "items": [...], "estimated_total": 8800}}
+
 event: done
 data: {"message": "完整回答……", "conversation_id": "conv_001"}
 ```
 
 错误以 `event: error` 推送；`conversation_id` 缺省时由服务端生成并在 `done` 中返回。
 记忆写回在 done 时统一执行（user+assistant 一次写入），中断连接不产生半写会话。
+
+**写操作确认回路**：propose 工具产生 `confirm_request` 事件（确认卡片数据）；
+前端渲染卡片，用户点击确认/取消后回发 `[CONFIRM:<op_id>]` / `[REJECT:<op_id>]`
+（或直接回复"确认"等短语）。服务端消费待确认操作（Redis 存储，TTL 5 分钟，
+每会话一个）并用存储的原始参数直接执行写工具，再由 LLM 基于真实执行结果作答。
+无待确认操作时确认消息回落为普通对话。
 
 ### 健康检查
 
@@ -259,8 +270,9 @@ GET /health
 | `add_favorite` | 收藏图书（写） | 需 JWT；异步受理；book_id 须来自检索结果 |
 | `remove_favorite` | 取消收藏（写） | 需 JWT；异步受理 |
 | `check_favorite` | 查询是否已收藏 | 需 JWT；用于复核异步收藏结果 |
-| `create_order` | 代创建待支付订单（写） | 需 JWT；Prompt 强制先复述书目/数量/总价并获确认；工具生成幂等键，LLM 重试不重复下单；内部轮询 Kafka 异步结果；不代支付 |
-| `cancel_order` | 取消待支付订单（写） | 需 JWT；仅待支付可取消（幂等）；须先向用户确认订单 |
+| `propose_order` | 提议下单（生成确认卡片） | 需 JWT；LLM 可见；卡片含书目/数量/预估总价（按书城现价）；用户确认后服务端执行真实下单 |
+| `propose_cancel_order` | 提议取消待支付订单 | 需 JWT；LLM 可见；仅待支付；用户确认后服务端执行 |
+| `create_order` / `cancel_order` | 真实写执行器 | **不暴露给 LLM**；仅服务端在用户确认后用存储参数执行（幂等键防重复下单、内部轮询 Kafka 结果、不代支付） |
 | `get_order_detail` | 单笔订单详情 | 需 JWT；含订单内书目/金额/状态 |
 
 工具描述明确分工"语义模糊找书用 semantic_search_books，精确书名用 search_books"，
@@ -283,14 +295,16 @@ GET /health
 - 落地 **RAG** 方案：向量召回 Top20 → 可选 Rerank 重排 → Top-K 上下文注入，
   以固定测试问题集量化关键词 vs 语义命中率
 - 扩展 Agent 工具集至 **14 个**（语义检索/资料/订单/收藏/浏览 + 收藏管理/代下单/取消订单），
-  实现"意图确认 → 幂等提交 → 异步结果轮询"的 **Agent 写操作闭环**（LLM 重试不重复下单），
+  实现 **propose → 确认卡片 → 服务端执行** 的机制级写操作确认回路：LLM 只能提议、
+  用户确认后服务端以存储参数真实执行（幂等键防重复下单、Kafka 异步结果轮询），
   完善参数校验、错误降级与多轮工具编排；同步与 SSE 流式共用单一生成器核心，避免两套逻辑漂移
 - 打通 **JWT 透传**链路，聚合订单/收藏/浏览行为构建用户画像注入 Prompt，
   实现个性化荐书与匿名降级策略
 - 设计 **滑动窗口 + LLM 摘要**的两级对话记忆（摘要保留用户偏好/已荐书/未决问题），
   长会话 Token 消耗受控且跨请求上下文连贯
-- 实现 **SSE 流式响应协议**（delta/tool_start/tool_end/done 事件），
-  首字延迟从整段生成降至首 token；断连不产生半写会话
+- 实现 **SSE 流式响应协议**（delta/tool_start/tool_end/confirm_request/done 事件），
+  首字延迟从整段生成降至首 token；断连不产生半写会话；
+  前端确认卡片与标记消息构成"人工确认在回路"的写操作安全闭环
 - 在 **Go/Gin** 微服务中新增行为埋点（Redis SETNX 去重防刷、唯一索引 upsert）
   与聚合画像接口，为推荐提供数据基建；Docker Compose 编排
   Milvus/MySQL/Redis/Go/Agent 多服务一键部署

@@ -14,7 +14,10 @@ from app.tools.user import (
 from app.tools.rag_search import semantic_search_books, rag_available, RAGSearchError
 from app.tools.bookstore_api import BookstoreAPIError
 from app.tools.favorite import add_favorite, remove_favorite, check_favorite
-from app.tools.order import create_order, cancel_order, get_order_detail
+from app.tools.order import (
+    create_order, cancel_order, get_order_detail,
+    propose_order, propose_cancel_order,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -292,11 +295,11 @@ TOOLS.extend([
     {
         "type": "function",
         "function": {
-            "name": "create_order",
+            "name": "propose_order",
             "description": (
-                "为当前用户创建待支付订单（真实写操作，不代支付）。"
-                "调用前必须已向用户复述书名、数量、单价与预估总价并获得明确同意。"
-                "book_id 必须来自检索结果；金额由书城按数据库价格计算"
+                "提议为当前用户创建待支付订单（生成确认卡片，不直接下单）。"
+                "用户同意下单后调用；系统会把书目/数量/预估总价卡片推给用户，"
+                "用户点击确认后自动执行。book_id 必须来自检索结果"
             ),
             "parameters": {
                 "type": "object",
@@ -334,14 +337,17 @@ TOOLS.extend([
     {
         "type": "function",
         "function": {
-            "name": "cancel_order",
-            "description": "取消当前用户的待支付订单（真实写操作，仅待支付状态可取消）。调用前必须向用户确认要取消的订单",
+            "name": "propose_cancel_order",
+            "description": (
+                "提议取消当前用户的待支付订单（生成确认卡片，不直接取消）。"
+                "用户要求取消订单时调用；用户点击确认后系统自动执行"
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "order_id": {
                         "type": "integer",
-                        "description": "订单 id（来自订单列表/详情/下单结果）",
+                        "description": "订单 id（来自订单列表/详情）",
                         "minimum": 1,
                     }
                 },
@@ -383,6 +389,9 @@ TOOL_MAP = {
     "add_favorite": add_favorite,
     "remove_favorite": remove_favorite,
     "check_favorite": check_favorite,
+    # 写操作：LLM 只见 propose_*（生成确认卡片）；真实执行器仅供服务端确认后调用
+    "propose_order": propose_order,
+    "propose_cancel_order": propose_cancel_order,
     "create_order": create_order,
     "cancel_order": cancel_order,
     "get_order_detail": get_order_detail,

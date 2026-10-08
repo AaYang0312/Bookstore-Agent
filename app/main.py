@@ -15,6 +15,7 @@ from app.memory import store as memory_store
 from app.memory.summarizer import maybe_compress
 from app.personalization.profile import build_profile_segment
 from app.schemas import AgentChatRequest, AgentChatResponse
+from app.tools import write_gate
 
 logger = logging.getLogger(__name__)
 
@@ -111,25 +112,70 @@ def _write_back(conversation_id: str, user_message: str, assistant_message: str)
         maybe_compress(conversation_id)
 
 
+# 确认卡片写回时使用的友好用户文案（替代原始 [CONFIRM:...] 标记）
+_CONFIRMED_USER_TEXT = {
+    "create_order": "（确认创建订单）",
+    "cancel_order": "（确认取消订单）",
+}
+
+
+def _confirmation_branch(conversation_id: str, message: str) -> tuple[str, dict | None]:
+    """识别确认/拒绝消息，返回 (分支, 待执行操作)。
+
+    分支：normal（普通对话）/ confirmed（用户确认，执行存储的操作）/
+    rejected（用户拒绝，清除待确认操作）。无匹配操作时回落 normal。
+    """
+    intent = write_gate.parse_confirmation(message)
+    if intent is None:
+        return "normal", None
+    kind, op_id = intent
+    if kind == "confirm":
+        operation = write_gate.consume_pending(conversation_id, op_id)
+        if operation is not None:
+            return "confirmed", operation
+        return "normal", None
+    if write_gate.clear_pending(conversation_id):
+        return "rejected", None
+    return "normal", None
+
+
 @app.post("/api/v1/agent/chat", response_model=AgentChatResponse)
 def chat(request: AgentChatRequest):
     history, summary = _assemble_context(request.conversation_id,
                                          [m.model_dump() for m in request.history])
+    write_gate.set_conversation_id(request.conversation_id)
     profile_segment = None
     if get_token():
         profile_segment = build_profile_segment()
 
+    branch, operation = _confirmation_branch(request.conversation_id, request.message)
+
     try:
-        reply = harness.model_call(
-            history=history,
-            message=request.message,
-            profile_segment=profile_segment,
-            summary=summary,
-        )
+        if branch == "confirmed":
+            # 用户已确认：服务端直接执行存储的写操作，LLM 基于真实结果作答
+            reply = harness.model_call_confirmed(
+                history=history,
+                operation=operation,
+                profile_segment=profile_segment,
+                summary=summary,
+            )
+            user_text = _CONFIRMED_USER_TEXT.get(operation["tool"], "（确认执行操作）")
+        else:
+            message = request.message
+            if branch == "rejected":
+                message = "（用户取消了刚才提议的操作，请友好回应，不要执行任何写操作）"
+            reply = harness.model_call(
+                history=history,
+                message=message,
+                profile_segment=profile_segment,
+                summary=summary,
+            )
+            user_text = request.message if branch == "normal" else "（取消操作）"
     except RuntimeError as e:
         reply = f"抱歉，处理您的请求时出现问题：{e}"
+        user_text = request.message
 
-    _write_back(request.conversation_id, request.message, reply)
+    _write_back(request.conversation_id, user_text, reply)
 
     return AgentChatResponse(
         message=reply,
@@ -149,24 +195,56 @@ def chat_stream(
     message: str = Query(min_length=1, max_length=1500),
     conversation_id: str | None = Query(default=None, max_length=100),
 ):
-    """SSE 流式对话：event 序列为 delta / tool_start / tool_end / done / error。
+    """SSE 流式对话：event 序列为 delta / tool_start / tool_end / confirm_request / done / error。
 
     支持 Authorization: Bearer <JWT> 头（个性化与用户数据工具）。
     conversation_id 缺省时由服务端生成并在 done 事件返回。
     """
-    if not conversation_id:
-        conversation_id = uuid.uuid4().hex
+    return _stream_response(message, conversation_id or uuid.uuid4().hex, [])
+
+
+@app.post("/api/v1/agent/chat/stream")
+def chat_stream_post(request: AgentChatRequest):
+    """POST 版 SSE 流式对话（请求体与同步 /chat 一致，可携带 history）。
+
+    供前端统一入口使用：响应仍为 text/event-stream。
+    """
+    conversation_id = request.conversation_id or uuid.uuid4().hex
+    return _stream_response(
+        request.message,
+        conversation_id,
+        [m.model_dump() for m in request.history],
+    )
+
+
+def _stream_response(message: str, conversation_id: str, client_history: list[dict]):
     token = get_token()
 
     def event_generator():
-        history, summary = _assemble_context(conversation_id, [])
+        # 在生成器执行上下文内设置会话 ID（propose 工具写入确认门时读取）
+        write_gate.set_conversation_id(conversation_id)
+        history, summary = _assemble_context(conversation_id, client_history)
         profile_segment = build_profile_segment(token) if token else None
 
         final_text = None
         try:
-            for event in harness.run_agent(
-                history, message, profile_segment=profile_segment, summary=summary,
-            ):
+            branch, operation = _confirmation_branch(conversation_id, message)
+            if branch == "confirmed":
+                events = harness.run_confirmed(
+                    history, operation, profile_segment=profile_segment, summary=summary,
+                )
+                user_text = _CONFIRMED_USER_TEXT.get(operation["tool"], "（确认执行操作）")
+            else:
+                agent_message = message
+                if branch == "rejected":
+                    agent_message = "（用户取消了刚才提议的操作，请友好回应，不要执行任何写操作）"
+                events = harness.run_agent(
+                    history, agent_message,
+                    profile_segment=profile_segment, summary=summary,
+                )
+                user_text = message if branch == "normal" else "（取消操作）"
+
+            for event in events:
                 if event["type"] == "delta":
                     yield _sse_event("delta", {"content": event["content"]})
                 elif event["type"] == "tool_start":
@@ -181,10 +259,16 @@ def chat_stream(
                         "name": event["name"],
                         "result": result[:TOOL_RESULT_SUMMARY_MAX_CHARS],
                     })
+                elif event["type"] == "confirm_request":
+                    # 写操作确认卡片：前端渲染确认/取消按钮，按钮回发确认标记消息
+                    yield _sse_event("confirm_request", {
+                        "operation_id": event["operation_id"],
+                        "summary": event["summary"],
+                    })
                 elif event["type"] == "final":
                     final_text = event["content"]
                     # 写回与 done 解耦：断连前完成记忆写回（幂等：user+assistant 一次写入）
-                    _write_back(conversation_id, message, final_text)
+                    _write_back(conversation_id, user_text, final_text)
                     yield _sse_event("done", {
                         "message": final_text,
                         "conversation_id": conversation_id,

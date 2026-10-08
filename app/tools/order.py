@@ -1,11 +1,18 @@
 # 订单工具：代创建订单（待支付，不代支付）/ 取消待支付订单 / 订单详情
 # 下单为 Kafka 异步：POST /order/create 受理后返回 pending，本模块内部轮询
 # /order/create/result 轮换为最终三态（created/failed/超时），对 LLM 呈现同步语义
+#
+# 写操作确认门：create_order / cancel_order 不暴露给 LLM，仅由服务端在用户确认后
+# 执行（harness.run_confirmed）；LLM 可见的是 propose_order / propose_cancel_order，
+# 它们只生成待确认操作与卡片数据（write_gate），不产生任何写副作用
 import logging
 import time
 import uuid
 
-from app.tools.bookstore_api import BookstoreAPIError, request_bookstore
+from app.auth_context import get_token
+from app.tools import write_gate
+from app.tools.book import get_book_detail
+from app.tools.bookstore_api import BookstoreAPIError, NOT_LOGGED_IN_HINT, request_bookstore
 
 logger = logging.getLogger(__name__)
 
@@ -176,3 +183,91 @@ def get_order_detail(order_id: int) -> dict:
     if not isinstance(data, dict):
         raise OrderAPIError("接口返回数据格式异常")
     return {"ok": True, "order": _normalize_order(data)}
+
+
+# ---- 确认卡片（propose）：LLM 可见的"提议"工具，不执行写操作 ----
+
+_WAITING_CONFIRM_MESSAGE = (
+    "已生成确认卡片并推送到用户界面。请告知用户点击卡片上的按钮确认或取消；"
+    "在用户确认前不得声称已执行，也不要重复提议。用户确认后系统会自动执行，"
+    "你将在下一轮收到真实执行结果"
+)
+
+
+def propose_order(items: list[dict]) -> dict:
+    """提议创建待支付订单：校验并按当前书城价格生成确认卡片，等待用户确认后由系统执行。
+
+    Args:
+        items: 订单项列表 [{"book_id": int, "quantity": int}]，book_id 必须来自检索结果
+    """
+    items = _validate_items(items)
+    if not get_token():
+        raise OrderAPIError(NOT_LOGGED_IN_HINT)
+
+    # 逐本取详情构建卡片（公开接口）：标题/现价/库存以书城当前数据为准
+    card_items = []
+    estimated_total = 0
+    for item in items:
+        detail = get_book_detail(item["book_id"])  # BookAPIError 由 registry 统一转换
+        book = detail.get("book") or {}
+        if book.get("stock", 0) < item["quantity"]:
+            raise OrderAPIError(f"《{book.get('title', item['book_id'])}》库存不足（剩余 {book.get('stock', 0)} 本）")
+        unit_price = book.get("current_price", 0)
+        subtotal = unit_price * item["quantity"]
+        card_items.append({
+            "book_id": item["book_id"],
+            "title": book.get("title", ""),
+            "quantity": item["quantity"],
+            "unit_price": unit_price,
+            "subtotal": subtotal,
+        })
+        estimated_total += subtotal
+
+    summary = {
+        "type": "create_order",
+        "title": "确认创建订单（待支付）",
+        "items": card_items,
+        "estimated_total": estimated_total,
+        "note": "总价以下单时书城实际计算为准；创建后 30 分钟内未支付将自动取消，助手不能代支付",
+    }
+    operation = write_gate.create_pending("create_order", {"items": items}, summary)
+    return {
+        "ok": True,
+        "action": "confirm_required",
+        "operation_id": operation["op_id"],
+        "summary": summary,
+        "message": _WAITING_CONFIRM_MESSAGE,
+    }
+
+
+def propose_cancel_order(order_id: int) -> dict:
+    """提议取消待支付订单：拉取真实订单内容生成确认卡片，等待用户确认后由系统执行。
+
+    Args:
+        order_id: 订单 ID
+    """
+    order_id = _validate_order_id(order_id)
+    payload = _call("GET", f"/order/{order_id}")
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        raise OrderAPIError("接口返回数据格式异常")
+    order = _normalize_order(data)
+    if order["status"] != 0:
+        raise OrderAPIError(
+            f"订单 {order_id} 当前为「{order['status_text']}」状态，仅待支付订单可以取消"
+        )
+
+    summary = {
+        "type": "cancel_order",
+        "title": "确认取消订单",
+        "order": order,
+        "note": "取消后不可恢复；已支付订单请前往订单页处理",
+    }
+    operation = write_gate.create_pending("cancel_order", {"order_id": order_id}, summary)
+    return {
+        "ok": True,
+        "action": "confirm_required",
+        "operation_id": operation["op_id"],
+        "summary": summary,
+        "message": _WAITING_CONFIRM_MESSAGE,
+    }
