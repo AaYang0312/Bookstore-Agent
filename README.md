@@ -6,7 +6,8 @@
 ## 功能特性
 
 - 自然语言对话：以购书助手角色与用户交流
-- 工具调用：7 个工具覆盖关键词搜索、语义找书、图书详情、联网搜索、用户画像/订单/收藏/浏览
+- 工具调用：14 个工具覆盖关键词搜索、语义找书、图书详情、联网搜索、用户画像/订单/收藏/浏览，以及收藏管理、代下单、取消订单等写操作（带确认策略）
+- 写操作闭环：可代用户创建**待支付订单**（不代支付，30 分钟未支付自动取消）与取消订单；下单走 Kafka 异步受理，工具内部轮询结果；幂等键防重复下单；Prompt 强制"复述书目与总价并获用户确认后才可下单"
 - RAG 知识库：Milvus 向量检索 + 可选 Rerank 重排，支持"模糊找书"语义命中
 - 个性化推荐：JWT 透传拉取书城聚合画像，注入 System Prompt（无登录自动降级）
 - 对话记忆：Redis 滑动窗口 + LLM 摘要两级记忆，跨请求上下文连贯，前端传 history 仍兼容
@@ -28,7 +29,7 @@ flowchart LR
         MEM[memory<br/>滑窗 + 摘要两级记忆]
         PERS[personalization<br/>画像拉取 + TTL 缓存]
         HAR[harness<br/>流式工具循环生成器]
-        TOOLS[tools × 7<br/>search/detail/web/semantic/user×4]
+        TOOLS[tools × 14<br/>检索/联网/用户数据/收藏/订单(含写操作)]
         RAG[rag<br/>embedder · vector_store · retriever · ingest]
     end
 
@@ -102,9 +103,12 @@ app/
 │   └── profile.py              # 画像拉取（60s 缓存）→ Prompt 画像段
 └── tools/
     ├── registry.py             # 工具注册（RAG 未配置时 semantic 工具不注册）
+    ├── bookstore_api.py        # 书城 HTTP 共享层（JWT 透传 + 非 2xx 业务 message 保留）
     ├── book.py / web.py        # 原有三工具（行为不变）
     ├── rag_search.py           # semantic_search_books（语义找书）
-    └── user.py                 # 画像/订单/收藏/浏览四工具（无 JWT 结构化降级）
+    ├── user.py                 # 画像/订单/收藏/浏览四工具（无 JWT 结构化降级）
+    ├── favorite.py             # 收藏新增/移除/查询（异步受理，check 可复核）
+    └── order.py                # 代下单(轮询终态)/取消订单/订单详情
 ```
 
 ## 快速开始
@@ -252,9 +256,16 @@ GET /health
 | `get_user_orders` | 用户订单 | 需 JWT |
 | `get_user_favorites` | 用户收藏 | 需 JWT |
 | `get_browse_history` | 浏览记录 | 需 JWT（数据来自 Go 后端浏览埋点） |
+| `add_favorite` | 收藏图书（写） | 需 JWT；异步受理；book_id 须来自检索结果 |
+| `remove_favorite` | 取消收藏（写） | 需 JWT；异步受理 |
+| `check_favorite` | 查询是否已收藏 | 需 JWT；用于复核异步收藏结果 |
+| `create_order` | 代创建待支付订单（写） | 需 JWT；Prompt 强制先复述书目/数量/总价并获确认；工具生成幂等键，LLM 重试不重复下单；内部轮询 Kafka 异步结果；不代支付 |
+| `cancel_order` | 取消待支付订单（写） | 需 JWT；仅待支付可取消（幂等）；须先向用户确认订单 |
+| `get_order_detail` | 单笔订单详情 | 需 JWT；含订单内书目/金额/状态 |
 
 工具描述明确分工"语义模糊找书用 semantic_search_books，精确书名用 search_books"，
-避免 LLM 路由选错工具。
+避免 LLM 路由选错工具；写操作工具（下单/取消/收藏）的描述内嵌确认前提，
+配合 Tool Prompt 的"写操作与确认策略"（下单前必须复述书目与总价并获得用户明确同意）。
 
 ## RAG 效果验证
 
@@ -271,8 +282,9 @@ GET /health
   "文档组装 → 向量化 → upsert" 的全量/增量入库管道（updated_at 水位 + 定时任务）
 - 落地 **RAG** 方案：向量召回 Top20 → 可选 Rerank 重排 → Top-K 上下文注入，
   以固定测试问题集量化关键词 vs 语义命中率
-- 扩展 Agent 工具集至 **7 个**（语义检索/资料/订单/收藏/浏览），完善参数校验、
-  错误降级与多轮工具编排；同步与 SSE 流式共用单一生成器核心，避免两套逻辑漂移
+- 扩展 Agent 工具集至 **14 个**（语义检索/资料/订单/收藏/浏览 + 收藏管理/代下单/取消订单），
+  实现"意图确认 → 幂等提交 → 异步结果轮询"的 **Agent 写操作闭环**（LLM 重试不重复下单），
+  完善参数校验、错误降级与多轮工具编排；同步与 SSE 流式共用单一生成器核心，避免两套逻辑漂移
 - 打通 **JWT 透传**链路，聚合订单/收藏/浏览行为构建用户画像注入 Prompt，
   实现个性化荐书与匿名降级策略
 - 设计 **滑动窗口 + LLM 摘要**的两级对话记忆（摘要保留用户偏好/已荐书/未决问题），

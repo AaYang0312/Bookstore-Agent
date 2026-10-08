@@ -36,7 +36,8 @@ def test_semantic_tool_registered_when_rag_configured(monkeypatch):
         names = {tool["function"]["name"] for tool in reloaded.TOOLS}
         assert "semantic_search_books" in names
         assert "semantic_search_books" in reloaded.TOOL_MAP
-        assert len(names) == 8
+        # 3 基础 + 1 语义 + 4 用户数据 + 3 收藏 + 3 订单
+        assert len(names) == 14
     finally:
         importlib.reload(registry)  # 恢复未配置状态
 

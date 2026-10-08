@@ -12,6 +12,9 @@ from app.tools.user import (
     UserAPIError,
 )
 from app.tools.rag_search import semantic_search_books, rag_available, RAGSearchError
+from app.tools.bookstore_api import BookstoreAPIError
+from app.tools.favorite import add_favorite, remove_favorite, check_favorite
+from app.tools.order import create_order, cancel_order, get_order_detail
 
 logger = logging.getLogger(__name__)
 
@@ -228,6 +231,146 @@ TOOLS.extend([
     },
 ])
 
+TOOLS.extend([
+    {
+        "type": "function",
+        "function": {
+            "name": "add_favorite",
+            "description": "把一本书加入当前用户的收藏（真实写操作）。仅在用户明确表达收藏意图时调用，book_id 必须来自检索结果",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "book_id": {
+                        "type": "integer",
+                        "description": "书籍 id（来自检索结果）",
+                        "minimum": 1,
+                    }
+                },
+                "required": ["book_id"],
+                "additionalProperties": False,
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "remove_favorite",
+            "description": "移除当前用户对某本书的收藏（真实写操作）。仅在用户明确表达取消收藏意图时调用",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "book_id": {
+                        "type": "integer",
+                        "description": "书籍 id",
+                        "minimum": 1,
+                    }
+                },
+                "required": ["book_id"],
+                "additionalProperties": False,
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_favorite",
+            "description": "查询当前用户是否已收藏某本书",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "book_id": {
+                        "type": "integer",
+                        "description": "书籍 id",
+                        "minimum": 1,
+                    }
+                },
+                "required": ["book_id"],
+                "additionalProperties": False,
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_order",
+            "description": (
+                "为当前用户创建待支付订单（真实写操作，不代支付）。"
+                "调用前必须已向用户复述书名、数量、单价与预估总价并获得明确同意。"
+                "book_id 必须来自检索结果；金额由书城按数据库价格计算"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "items": {
+                        "type": "array",
+                        "description": "订单项列表",
+                        "minItems": 1,
+                        "maxItems": 10,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "book_id": {
+                                    "type": "integer",
+                                    "description": "书籍 id（来自检索结果）",
+                                    "minimum": 1,
+                                },
+                                "quantity": {
+                                    "type": "integer",
+                                    "description": "购买数量",
+                                    "minimum": 1,
+                                    "maximum": 99,
+                                }
+                            },
+                            "required": ["book_id", "quantity"],
+                            "additionalProperties": False,
+                        }
+                    }
+                },
+                "required": ["items"],
+                "additionalProperties": False,
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cancel_order",
+            "description": "取消当前用户的待支付订单（真实写操作，仅待支付状态可取消）。调用前必须向用户确认要取消的订单",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "order_id": {
+                        "type": "integer",
+                        "description": "订单 id（来自订单列表/详情/下单结果）",
+                        "minimum": 1,
+                    }
+                },
+                "required": ["order_id"],
+                "additionalProperties": False,
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_order_detail",
+            "description": "获取当前用户单笔订单的详情（含订单内图书、金额与状态），用于回答订单内容/进度类问题",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "order_id": {
+                        "type": "integer",
+                        "description": "订单 id",
+                        "minimum": 1,
+                    }
+                },
+                "required": ["order_id"],
+                "additionalProperties": False,
+            }
+        }
+    },
+])
+
 TOOL_MAP = {
     "search_books": search_books,
     "get_book_detail": get_book_detail,
@@ -237,6 +380,12 @@ TOOL_MAP = {
     "get_user_orders": get_user_orders,
     "get_user_favorites": get_user_favorites,
     "get_browse_history": get_browse_history,
+    "add_favorite": add_favorite,
+    "remove_favorite": remove_favorite,
+    "check_favorite": check_favorite,
+    "create_order": create_order,
+    "cancel_order": cancel_order,
+    "get_order_detail": get_order_detail,
 }
 
 def execute_tool(name: str, arguments: str) -> str:
@@ -272,6 +421,9 @@ def execute_tool(name: str, arguments: str) -> str:
     except UserAPIError as e:
         return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
     except RAGSearchError as e:
+        return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
+    except BookstoreAPIError as e:
+        # 收藏/订单等走共享层的工具：message 已面向 LLM，直接透出
         return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
     except TypeError as e:
         return json.dumps({"ok": False, "error": f"参数错误: {e}"}, ensure_ascii=False)
