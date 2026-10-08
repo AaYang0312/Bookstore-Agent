@@ -191,7 +191,7 @@ TOOL_RESULT_SUMMARY_MAX_CHARS = 300
 
 
 @app.get("/api/v1/agent/chat/stream")
-def chat_stream(
+async def chat_stream(
     message: str = Query(min_length=1, max_length=1500),
     conversation_id: str | None = Query(default=None, max_length=100),
 ):
@@ -200,16 +200,21 @@ def chat_stream(
     支持 Authorization: Bearer <JWT> 头（个性化与用户数据工具）。
     conversation_id 缺省时由服务端生成并在 done 事件返回。
     """
-    return _stream_response(message, conversation_id or uuid.uuid4().hex, [])
+    conversation_id = conversation_id or uuid.uuid4().hex
+    # 必须在 async 端点（ASGI 任务上下文）内设置：SSE 生成器经线程池逐段迭代，
+    # 每段从任务上下文重新拷贝，生成器内部 set 的值无法跨迭代存活
+    write_gate.set_conversation_id(conversation_id)
+    return _stream_response(message, conversation_id, [])
 
 
 @app.post("/api/v1/agent/chat/stream")
-def chat_stream_post(request: AgentChatRequest):
+async def chat_stream_post(request: AgentChatRequest):
     """POST 版 SSE 流式对话（请求体与同步 /chat 一致，可携带 history）。
 
     供前端统一入口使用：响应仍为 text/event-stream。
     """
     conversation_id = request.conversation_id or uuid.uuid4().hex
+    write_gate.set_conversation_id(conversation_id)
     return _stream_response(
         request.message,
         conversation_id,
@@ -221,8 +226,6 @@ def _stream_response(message: str, conversation_id: str, client_history: list[di
     token = get_token()
 
     def event_generator():
-        # 在生成器执行上下文内设置会话 ID（propose 工具写入确认门时读取）
-        write_gate.set_conversation_id(conversation_id)
         history, summary = _assemble_context(conversation_id, client_history)
         profile_segment = build_profile_segment(token) if token else None
 

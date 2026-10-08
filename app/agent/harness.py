@@ -195,27 +195,31 @@ def run_confirmed(history: list, operation: dict, profile_segment: str | None = 
                   summary: str | None = None):
     """用户确认后的执行流：用存储的原始参数直接执行写操作，再让 LLM 基于真实结果作答。
 
-    执行不经 LLM——模型物理上无法触发或篡改写操作；LLM 只负责把执行结果组织成回复。
+    执行不经 LLM——模型物理上无法触发或篡改写操作。执行结果以系统注入的用户消息
+    交给 LLM 组织回复（不回放合成的 assistant tool_calls：DeepSeek 思考模式等
+    OpenAI 兼容后端会校验 tool_calls 消息必须携带模型原始 reasoning_content）。
     """
     tool = operation["tool"]
     arguments = json.dumps(operation["arguments"], ensure_ascii=False)
-    call_id = f"confirm_{operation['op_id']}"
 
     result = execute_tool(tool, arguments)
 
     messages = _base_messages(history, profile_segment, summary)
-    messages.append({"role": "user", "content": "（用户已点击确认卡片，同意执行刚才提议的操作）"})
-    messages.append({
-        "role": "assistant",
-        "content": None,
-        "tool_calls": [{
-            "id": call_id,
-            "type": "function",
-            "function": {"name": tool, "arguments": arguments},
-        }],
-    })
-    messages.append({"role": "tool", "tool_call_id": call_id, "content": result})
-    yield from _reply_loop(messages)
+    messages.append({"role": "user", "content": (
+        "（用户已点击确认卡片，系统已自动执行刚才提议的操作，以下是真实执行结果）\n"
+        f"操作：{tool} {arguments}\n"
+        f"结果（JSON）：{result}\n"
+        "请基于以上真实结果向用户报告：成功则给出订单号/订单号与后续步骤（待支付、"
+        "30 分钟未支付自动取消、需自行到书城支付）；失败则如实说明原因，不得编造。"
+    )})
+    for event in _reply_loop(messages):
+        if event["type"] == "error":
+            # 写操作已执行、仅回复生成失败：提示不要重复操作（否则可能重复下单）
+            event = {**event, "message": (
+                f"{event['message']}（注意：写操作可能已实际执行，请让用户稍后在订单列表"
+                "确认结果，暂勿重复操作）"
+            )}
+        yield event
 
 
 def model_call(history: list[ChatMessage], message: str,

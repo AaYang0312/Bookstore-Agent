@@ -124,11 +124,12 @@ def test_run_confirmed_executes_stored_operation(monkeypatch):
         captured["arguments"] = arguments
         return json.dumps({"ok": True, "order_id": 8})
 
+    def fake_loop(messages):
+        captured["injected_user_message"] = messages[-1]["content"]
+        yield {"type": "final", "content": "已下单"}
+
     monkeypatch.setattr(harness, "execute_tool", fake_execute)
-    monkeypatch.setattr(
-        harness, "_reply_loop",
-        lambda messages: iter([{"type": "final", "content": "已下单"}]),
-    )
+    monkeypatch.setattr(harness, "_reply_loop", fake_loop)
 
     operation = {"op_id": "x" * 16, "tool": "create_order",
                  "arguments": {"items": [{"book_id": 9, "quantity": 2}]}}
@@ -137,7 +138,26 @@ def test_run_confirmed_executes_stored_operation(monkeypatch):
     # 用存储的原始参数执行，不经 LLM
     assert captured["name"] == "create_order"
     assert json.loads(captured["arguments"]) == operation["arguments"]
+    # 执行结果以系统注入的用户消息交给 LLM（不回放合成 tool_calls，兼容思考模式后端）
+    assert "order_id" in captured["injected_user_message"]
     assert events[-1]["content"] == "已下单"
+
+
+def test_run_confirmed_error_after_execution_hints_no_retry(monkeypatch):
+    """执行成功但回复生成失败时，错误信息必须提示不要重复操作（防重复下单）。"""
+    from app.agent import harness
+
+    monkeypatch.setattr(harness, "execute_tool",
+                        lambda name, args: json.dumps({"ok": True, "order_id": 9}))
+    monkeypatch.setattr(
+        harness, "_reply_loop",
+        lambda messages: iter([{"type": "error", "message": "模型返回空响应"}]),
+    )
+
+    operation = {"op_id": "y" * 16, "tool": "create_order", "arguments": {"items": []}}
+    events = list(harness.run_confirmed([], operation))
+
+    assert "暂勿重复操作" in events[-1]["message"]
 
 
 # ---- SSE：confirm_request 事件透传 + 确认分支 ----
@@ -225,3 +245,29 @@ def test_stale_confirmation_falls_back_to_normal(monkeypatch):
     events = _parse_sse(response.text)
     assert events[-1][1]["message"] == "请问要确认什么？"
     assert called["message"] == "确认"
+
+
+def test_stream_context_survives_across_sse_iterations(monkeypatch):
+    """回归：SSE 生成器经线程池逐段迭代，每段从 ASGI 任务重新拷贝上下文。
+
+    会话 ID 必须在 async 端点（任务上下文）内设置；若在生成器内部设置，
+    第二次迭代（模拟 LLM 多轮流式输出后的工具执行）读到的会是 None，
+    propose 工具将因"缺少 conversation_id"失败。
+    """
+    seen = {}
+
+    def fake_run(history, message, profile_segment=None, summary=None):
+        yield {"type": "delta", "content": "第一段"}   # 迭代边界 1
+        seen["cid"] = write_gate.get_conversation_id()  # 迭代边界 2 的线程上下文
+        yield {"type": "final", "content": "done"}
+
+    monkeypatch.setattr(main_module.harness, "run_agent", fake_run)
+    monkeypatch.setattr(write_gate, "get_redis", lambda: None)
+    client = TestClient(app)
+
+    response = client.post("/api/v1/agent/chat/stream", json={
+        "message": "hi", "conversation_id": "ctx-regression-1",
+    })
+
+    assert response.status_code == 200
+    assert seen["cid"] == "ctx-regression-1"
