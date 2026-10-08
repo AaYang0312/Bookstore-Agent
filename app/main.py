@@ -265,6 +265,7 @@ def _stream_response(message: str, conversation_id: str, client_history: list[di
                 elif event["type"] == "confirm_request":
                     # 写操作确认卡片：前端渲染确认/取消按钮，按钮回发确认标记消息
                     yield _sse_event("confirm_request", {
+                        "action": "confirm_required",
                         "operation_id": event["operation_id"],
                         "summary": event["summary"],
                     })

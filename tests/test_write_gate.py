@@ -73,6 +73,67 @@ def test_create_requires_conversation():
         write_gate.create_pending("create_order", {}, {})
 
 
+class _DownRedis:
+    """已配置但连不上的 Redis：每次命令都拒绝连接。"""
+
+    def set(self, *args, **kwargs):
+        raise ConnectionError("Connection refused")
+
+    def get(self, *args, **kwargs):
+        raise ConnectionError("Connection refused")
+
+    def delete(self, *args, **kwargs):
+        raise ConnectionError("Connection refused")
+
+
+class _MemoryRedis:
+    def __init__(self):
+        self.store = {}
+
+    def set(self, key, value, ex=None):
+        self.store[key] = value
+
+    def get(self, key):
+        return self.store.get(key)
+
+    def delete(self, key):
+        return 1 if self.store.pop(key, None) is not None else 0
+
+
+def test_redis_outage_falls_back_to_memory(monkeypatch):
+    """Redis 连接被拒时仍要留下可确认的待执行操作，不能把提议抛成工具失败。"""
+    monkeypatch.setattr(write_gate, "get_redis", lambda: _DownRedis())
+
+    operation = write_gate.create_pending(
+        "create_order", {"items": [{"book_id": 9, "quantity": 3}]}, {"type": "create_order"})
+
+    assert write_gate.get_pending("conv-test")["op_id"] == operation["op_id"]
+    consumed = write_gate.consume_pending("conv-test", operation["op_id"])
+    assert consumed["arguments"] == {"items": [{"book_id": 9, "quantity": 3}]}
+    assert write_gate.get_pending("conv-test") is None
+
+
+def test_redis_outage_clear_uses_memory(monkeypatch):
+    monkeypatch.setattr(write_gate, "get_redis", lambda: _DownRedis())
+    write_gate.create_pending("cancel_order", {"order_id": 5}, {"type": "cancel_order"})
+
+    assert write_gate.clear_pending("conv-test") is True
+    assert write_gate.clear_pending("conv-test") is False
+
+
+def test_healthy_redis_is_preferred_over_stale_memory(monkeypatch):
+    client = _MemoryRedis()
+    monkeypatch.setattr(write_gate, "get_redis", lambda: client)
+
+    operation = write_gate.create_pending(
+        "create_order", {"items": [{"book_id": 1}]}, {"type": "create_order"})
+
+    assert write_gate._memory_store == {}
+    assert write_gate.get_pending("conv-test")["op_id"] == operation["op_id"]
+    assert write_gate.consume_pending("conv-test", operation["op_id"])["op_id"] == operation["op_id"]
+    assert client.store == {}
+
+
 # ---- 确认消息解析 ----
 
 @pytest.mark.parametrize("text,kind", [

@@ -37,10 +37,69 @@ def _key(conversation_id: str) -> str:
     return f"{KEY_PREFIX}:{conversation_id}"
 
 
+def _redis_call(operation):
+    """执行一次 Redis 操作。
+
+    Returns:
+        (True, value) 表示 Redis 可用；(False, None) 表示未配置或调用失败，调用方改走内存。
+    """
+    try:
+        client = get_redis()
+    except Exception as exc:
+        logger.warning("Redis 客户端不可用，确认门降级到进程内存: %s", exc)
+        return False, None
+    if client is None:
+        return False, None
+    try:
+        return True, operation(client)
+    except Exception as exc:
+        logger.warning("Redis 操作失败，确认门降级到进程内存: %s", exc)
+        return False, None
+
+
+def _memory_get(conversation_id: str) -> dict | None:
+    entry = _memory_store.get(conversation_id)
+    if not entry:
+        return None
+    raw, expires_at = entry
+    if time.time() >= expires_at:
+        _memory_store.pop(conversation_id, None)
+        return None
+    return _decode(raw)
+
+
+def _memory_put(conversation_id: str, raw: str) -> None:
+    _gc_memory()
+    _memory_store[conversation_id] = (raw, time.time() + PENDING_TTL_SECONDS)
+
+
+def _prefer_pending(primary: dict | None, secondary: dict | None) -> dict | None:
+    """两份存储都有记录时取更新的一张，避免 Redis 故障期间旧键盖住内存里的新提议。"""
+    if primary is None:
+        return secondary
+    if secondary is None:
+        return primary
+    primary_at = primary.get("created_at") or 0
+    secondary_at = secondary.get("created_at") or 0
+    return secondary if secondary_at >= primary_at else primary
+
+
+def _load_pending(conversation_id: str) -> dict | None:
+    ok, raw = _redis_call(lambda client: client.get(_key(conversation_id)))
+    redis_op = _decode(raw) if ok else None
+    return _prefer_pending(redis_op, _memory_get(conversation_id))
+
+
+def _drop_pending(conversation_id: str) -> None:
+    _redis_call(lambda client: client.delete(_key(conversation_id)))
+    _memory_store.pop(conversation_id, None)
+
+
 def create_pending(tool: str, arguments: dict, summary: dict) -> dict:
     """创建（覆盖）当前会话的待确认操作，返回完整操作对象。
 
     每个会话同时只有一个待确认操作：用户改主意重新 propose 时旧卡片自动作废。
+    Redis 不可用时写入进程内存，避免提议阶段抛异常导致确认卡片发不出去。
     """
     conversation_id = get_conversation_id()
     if not conversation_id:
@@ -52,33 +111,19 @@ def create_pending(tool: str, arguments: dict, summary: dict) -> dict:
         "summary": summary,
         "created_at": time.time(),
     }
-    client = get_redis()
-    if client is not None:
-        client.set(_key(conversation_id), json.dumps(operation, ensure_ascii=False),
-                   ex=PENDING_TTL_SECONDS)
+    raw = json.dumps(operation, ensure_ascii=False)
+    ok, _ = _redis_call(lambda client: client.set(
+        _key(conversation_id), raw, ex=PENDING_TTL_SECONDS))
+    if ok:
+        # 写入成功则丢掉同会话的内存副本，避免故障恢复后读到过期提议
+        _memory_store.pop(conversation_id, None)
     else:
-        _gc_memory()
-        _memory_store[conversation_id] = (
-            json.dumps(operation, ensure_ascii=False), time.time() + PENDING_TTL_SECONDS)
+        _memory_put(conversation_id, raw)
     return operation
 
 
 def get_pending(conversation_id: str) -> dict | None:
-    client = get_redis()
-    if client is not None:
-        try:
-            raw = client.get(_key(conversation_id))
-        except Exception:
-            return None
-        return _decode(raw)
-    entry = _memory_store.get(conversation_id)
-    if not entry:
-        return None
-    raw, expires_at = entry
-    if time.time() >= expires_at:
-        _memory_store.pop(conversation_id, None)
-        return None
-    return _decode(raw)
+    return _load_pending(conversation_id)
 
 
 def consume_pending(conversation_id: str, op_id: str | None = None) -> dict | None:
@@ -86,40 +131,20 @@ def consume_pending(conversation_id: str, op_id: str | None = None) -> dict | No
 
     不匹配（过期/已被消费/op_id 不符）返回 None。
     """
-    client = get_redis()
-    if client is not None:
-        try:
-            raw = client.get(_key(conversation_id))
-            operation = _decode(raw)
-            if operation is None or not _op_matches(operation, op_id):
-                return None
-            client.delete(_key(conversation_id))
-            return operation
-        except Exception:
-            return None
-    entry = _memory_store.get(conversation_id)
-    if not entry:
-        return None
-    raw, expires_at = entry
-    if time.time() >= expires_at:
-        _memory_store.pop(conversation_id, None)
-        return None
-    operation = _decode(raw)
+    operation = _load_pending(conversation_id)
     if operation is None or not _op_matches(operation, op_id):
         return None
-    _memory_store.pop(conversation_id, None)
+    _drop_pending(conversation_id)
     return operation
 
 
 def clear_pending(conversation_id: str) -> bool:
     """删除待确认操作（用户拒绝），返回是否确有操作被清除。"""
-    client = get_redis()
-    if client is not None:
-        try:
-            return bool(client.delete(_key(conversation_id)))
-        except Exception:
-            return False
-    return _memory_store.pop(conversation_id, None) is not None
+    existed = _load_pending(conversation_id) is not None
+    if not existed:
+        return False
+    _drop_pending(conversation_id)
+    return True
 
 
 def _op_matches(operation: dict, op_id: str | None) -> bool:

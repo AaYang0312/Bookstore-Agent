@@ -60,6 +60,32 @@ def test_propose_order_rejects_insufficient_stock(monkeypatch):
         propose_order(items=[{"book_id": 9, "quantity": 2}])
 
 
+def test_propose_order_survives_redis_outage(monkeypatch):
+    """Redis 拒绝连接时 propose 仍返回确认卡片，而不是被登记成「工具执行失败」。"""
+    from app.tools.registry import execute_tool
+
+    class DownRedis:
+        def set(self, *args, **kwargs):
+            raise ConnectionError("Connection refused")
+
+        def get(self, *args, **kwargs):
+            raise ConnectionError("Connection refused")
+
+        def delete(self, *args, **kwargs):
+            raise ConnectionError("Connection refused")
+
+    _setup(monkeypatch, book_detail=_detail(price=5900, discount=20, stock=98))
+    monkeypatch.setattr(write_gate, "get_redis", lambda: DownRedis())
+
+    raw = execute_tool("propose_order", json.dumps({"items": [{"book_id": 9, "quantity": 3}]}))
+    result = json.loads(raw)
+
+    assert result["ok"] is True
+    assert result["action"] == "confirm_required"
+    assert result["summary"]["estimated_total"] == 14160  # 5900 * 80% * 3
+    assert write_gate.get_pending("confirm-flow")["op_id"] == result["operation_id"]
+
+
 def test_propose_order_requires_jwt(monkeypatch):
     _setup(monkeypatch, book_detail=_detail(), token=None)
 
